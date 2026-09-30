@@ -1,0 +1,29 @@
+{
+  "name": "bracazoric-backend",
+  "version": "1.0.0",
+  "description": "Backend API for B2B wholesale distribution system",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "init-db": "node init.js",
+    "test": "echo \"Tests will be added in the testing phase\""
+  },
+  "keywords": [
+    "node",
+    "express",
+    "postgresql",
+    "b2b",
+    "wholesale"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.1",
+    "express": "^5.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.16.3"
+  }
+}
