@@ -7,7 +7,7 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "init-db": "node init.js",
-    "test": "echo \"Tests will be added in the testing phase\""
+    "test": "node --test tests/*.test.js"
   },
   "keywords": [
     "node",

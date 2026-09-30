@@ -3,18 +3,10 @@ const { randomUUID } = require("crypto");
 const router = express.Router();
 const pool = require("../db");
 const { authenticate, requireRole } = require("../middleware/auth");
-
-function toCents(value) {
-  const normalized = String(value ?? "").trim().replace(",", ".");
-  const numeric = Number(normalized);
-
-  if (!Number.isFinite(numeric)) return null;
-  return Math.round(numeric * 100);
-}
-
-function centsToMoney(cents) {
-  return (cents / 100).toFixed(2);
-}
+const {
+  allocatePayment,
+  PaymentAllocationError,
+} = require("../services/paymentAllocator");
 
 router.get(
   "/",
@@ -40,7 +32,10 @@ router.get(
       return res.json(result.rows);
     } catch (error) {
       console.error("Greška kod dohvatanja istorije:", error);
-      return res.status(500).json({ success: false, message: "Greška na serveru." });
+      return res.status(500).json({
+        success: false,
+        message: "Greška na serveru.",
+      });
     }
   }
 );
@@ -51,19 +46,11 @@ router.post(
   requireRole("firma"),
   async (req, res) => {
     const { trgovinaId, tip, iznos, opis } = req.body;
-    const iznosCents = toCents(iznos);
 
     if (!trgovinaId || !["UPLATA", "AMBALAZA"].includes(tip)) {
       return res.status(400).json({
         success: false,
         message: "Podaci transakcije nisu ispravni.",
-      });
-    }
-
-    if (iznosCents === null || iznosCents <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Iznos mora biti veći od 0.",
       });
     }
 
@@ -97,24 +84,7 @@ router.post(
         [trgovinaId]
       );
 
-      if (racuniResult.rows.length === 0) {
-        const error = new Error("Trgovina nema otvorenih računa.");
-        error.status = 400;
-        throw error;
-      }
-
-      const ukupanDugCents = racuniResult.rows.reduce((sum, racun) => {
-        const racunCents = toCents(racun.iznos) ?? 0;
-        const uplacenoCents = toCents(racun.uplaceno) ?? 0;
-        return sum + Math.max(racunCents - uplacenoCents, 0);
-      }, 0);
-
-      if (iznosCents > ukupanDugCents) {
-        const error = new Error("Iznos je veći od trenutnog duga.");
-        error.status = 400;
-        throw error;
-      }
-
+      const plan = allocatePayment(racuniResult.rows, iznos);
       const transakcijaId = randomUUID();
       const createdAt = new Date();
       const datum = createdAt.toISOString();
@@ -128,52 +98,26 @@ router.post(
           transakcijaId,
           trgovinaId,
           tip,
-          centsToMoney(iznosCents),
+          plan.paymentAmount,
           opis || (tip === "UPLATA" ? "Uplata gotovine" : "Povrat ambalaže"),
           datum,
           createdAt,
         ]
       );
 
-      let preostaloCents = iznosCents;
-      const alokacije = [];
-
-      for (const racun of racuniResult.rows) {
-        if (preostaloCents <= 0) break;
-
-        const racunCents = toCents(racun.iznos) ?? 0;
-        const vecUplacenoCents = toCents(racun.uplaceno) ?? 0;
-        const dugRacunaCents = Math.max(racunCents - vecUplacenoCents, 0);
-
-        if (dugRacunaCents <= 0) continue;
-
-        const alociranoCents = Math.min(preostaloCents, dugRacunaCents);
-        const novoUplacenoCents = vecUplacenoCents + alociranoCents;
-        const potpunoPlaceno = novoUplacenoCents >= racunCents;
-
+      for (const allocation of plan.allocations) {
         await client.query(
           `UPDATE racuni
            SET uplaceno = $1, placen = $2
            WHERE id = $3`,
-          [centsToMoney(novoUplacenoCents), potpunoPlaceno, racun.id]
+          [allocation.newPaidAmount, allocation.fullyPaid, allocation.racunId]
         );
 
         await client.query(
           `INSERT INTO alokacije_transakcija (transakcija_id, racun_id, iznos)
            VALUES ($1, $2, $3)`,
-          [transakcijaId, racun.id, centsToMoney(alociranoCents)]
+          [transakcijaId, allocation.racunId, allocation.allocatedAmount]
         );
-
-        alokacije.push({
-          racunId: racun.id,
-          iznos: centsToMoney(alociranoCents),
-        });
-
-        preostaloCents -= alociranoCents;
-      }
-
-      if (preostaloCents !== 0) {
-        throw new Error("Transakcija nije mogla biti u potpunosti raspoređena.");
       }
 
       await client.query("COMMIT");
@@ -182,17 +126,23 @@ router.post(
         success: true,
         transakcijaId,
         tip,
-        iznos: centsToMoney(iznosCents),
-        preostaliDug: centsToMoney(ukupanDugCents - iznosCents),
-        alokacije,
+        iznos: plan.paymentAmount,
+        preostaliDug: plan.remainingDebtAmount,
+        alokacije: plan.allocations.map((allocation) => ({
+          racunId: allocation.racunId,
+          iznos: allocation.allocatedAmount,
+        })),
       });
     } catch (error) {
       await client.query("ROLLBACK");
       console.error("Greška pri knjiženju transakcije:", error);
 
+      const knownError =
+        error instanceof PaymentAllocationError || error.status;
+
       return res.status(error.status || 500).json({
         success: false,
-        message: error.status ? error.message : "Greška na serveru.",
+        message: knownError ? error.message : "Greška na serveru.",
       });
     } finally {
       client.release();
